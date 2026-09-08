@@ -1,36 +1,46 @@
-import {
-  runJavaScriptCode,
-  runPythonCode,
-} from "@/components/code-runner-actions";
-import CodeRunnerServerAction from "@/components/code-runner-server-action";
-import CodeRunnerReact from "./code-runner-react";
+import CodeRunnerReact, {
+  type PreviewBundleMode,
+  type PreviewVendorMode,
+} from "./code-runner-react";
 
 export default function CodeRunner({
   language,
   code,
+  files,
+  onRequestFix,
+  previewDebounceMs,
+  previewVendor,
+  previewBundleMode,
+  isFixPending,
+  allowAutoFix,
+  refreshNonce,
+  isActivePane,
 }: {
-  language: string;
-  code: string;
+  language?: string;
+  code?: string;
+  files?: Array<{ path: string; content: string }>;
+  onRequestFix?: (e: string) => void;
+  previewDebounceMs?: number;
+  previewVendor?: PreviewVendorMode;
+  previewBundleMode?: PreviewBundleMode;
+  isFixPending?: boolean;
+  allowAutoFix?: boolean;
+  refreshNonce?: number;
+  isActivePane?: boolean;
 }) {
-  return <CodeRunnerReact code={code} />;
-
+  const actualFiles =
+    files || (code ? [{ path: "App.tsx", content: code }] : []);
   return (
-    <>
-      {language === "python" ? (
-        <CodeRunnerServerAction
-          code={code}
-          runCodeAction={runPythonCode}
-          key={code}
-        />
-      ) : ["ts", "js", "javascript", "typescript"].includes(language) ? (
-        <CodeRunnerServerAction
-          code={code}
-          runCodeAction={runJavaScriptCode}
-          key={code}
-        />
-      ) : (
-        <CodeRunnerReact code={code} />
-      )}
-    </>
+    <CodeRunnerReact
+      files={actualFiles}
+      onRequestFix={onRequestFix}
+      previewDebounceMs={previewDebounceMs}
+      previewVendor={previewVendor}
+      previewBundleMode={previewBundleMode}
+      isFixPending={isFixPending}
+      allowAutoFix={allowAutoFix}
+      refreshNonce={refreshNonce}
+      isActivePane={isActivePane}
+    />
   );
 }

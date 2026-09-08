@@ -2,20 +2,52 @@
 
 import { createMessage } from "@/app/(main)/actions";
 import LogoSmall from "@/components/icons/logo-small";
-import { splitByFirstCodeFence } from "@/lib/utils";
-import Link from "next/link";
+import {
+  parseReplySegments,
+  extractFirstCodeBlock,
+  extractAllCodeBlocks,
+  getFilesFromMessage,
+  sanitizeAssistantOutput,
+} from "@/lib/utils";
+import {
+  FIX_REQUEST_PREFIX,
+  describePathlessFenceProblem,
+  shouldAllowAutoFix,
+} from "@/lib/chat-auto-fix";
+import { createLocalChatTitle } from "@/lib/chat-title";
 import { useRouter } from "next/navigation";
-import { startTransition, use, useEffect, useRef, useState } from "react";
+import {
+  memo,
+  startTransition,
+  use,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { ChatCompletionStream } from "together-ai/lib/ChatCompletionStream.mjs";
 import ChatBox from "./chat-box";
 import ChatLog from "./chat-log";
 import CodeViewer from "./code-viewer";
 import CodeViewerLayout from "./code-viewer-layout";
-import type { Chat } from "./page";
+import type { Chat, Message } from "./page";
 import { Context } from "../../providers";
+
+const HeaderChat = memo(({ title }: { title: string }) => (
+  <div className="flex items-center gap-4 px-4 py-4">
+    <a href="/" target="_blank">
+      <LogoSmall />
+    </a>
+    <p className="italic text-gray-500">{title}</p>
+  </div>
+));
+
+HeaderChat.displayName = "HeaderChat";
 
 export default function PageClient({ chat }: { chat: Chat }) {
   const context = use(Context);
+  const [chatTitle, setChatTitle] = useState(chat.title);
   const [streamPromise, setStreamPromise] = useState<
     Promise<ReadableStream> | undefined
   >(context.streamPromise);
@@ -26,9 +58,51 @@ export default function PageClient({ chat }: { chat: Chat }) {
   const [activeTab, setActiveTab] = useState<"code" | "preview">("preview");
   const router = useRouter();
   const isHandlingStreamRef = useRef(false);
+  const isUpdatingTitleRef = useRef(false);
   const [activeMessage, setActiveMessage] = useState(
-    chat.messages.filter((m) => m.role === "assistant").at(-1),
+    chat.messages
+      .filter((m) => m.role === "assistant" && extractFirstCodeBlock(m.content))
+      .at(-1),
   );
+
+  const [optimisticMessages, setOptimisticMessages] = useState<Message[]>([]);
+  const [isFixPending, setIsFixPending] = useState(false);
+  const autoFixMessageIdsRef = useRef<Set<string>>(new Set());
+
+  const allowAutoFix = useMemo(() => {
+    return shouldAllowAutoFix({
+      messages: chat.messages,
+      activeMessage,
+      streamText,
+      autoFixMessageIds: autoFixMessageIdsRef.current,
+    });
+  }, [chat, activeMessage, streamText]);
+
+  useEffect(() => {
+    if (isUpdatingTitleRef.current) return;
+    if (chat.title !== createLocalChatTitle(chat.prompt)) return;
+
+    isUpdatingTitleRef.current = true;
+    const controller = new AbortController();
+
+    fetch("/api/generate-chat-title", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chatId: chat.id }),
+      signal: controller.signal,
+    })
+      .then((res) => (res.ok ? res.json() : undefined))
+      .then((data) => {
+        if (typeof data?.title === "string") {
+          setChatTitle(data.title);
+        }
+      })
+      .catch(() => {
+        isUpdatingTitleRef.current = false;
+      });
+
+    return () => controller.abort();
+  }, [chat.id, chat.prompt, chat.title]);
 
   useEffect(() => {
     async function f() {
@@ -37,19 +111,87 @@ export default function PageClient({ chat }: { chat: Chat }) {
       isHandlingStreamRef.current = true;
       context.setStreamPromise(undefined);
 
-      const stream = await streamPromise;
+      const resetStream = () => {
+        isHandlingStreamRef.current = false;
+        setStreamText("");
+        setStreamPromise(undefined);
+      };
+
+      let stream: ReadableStream;
+      try {
+        stream = await streamPromise;
+      } catch {
+        resetStream();
+        return;
+      }
+
       let didPushToCode = false;
       let didPushToPreview = false;
+      let didFinalize = false;
+      let latestContent = "";
+
+      const persistResponse = (rawText: string) => {
+        if (didFinalize) return;
+        didFinalize = true;
+
+        const finalText = sanitizeAssistantOutput(rawText);
+        if (!finalText.trim()) {
+          resetStream();
+          return;
+        }
+
+        startTransition(async () => {
+          // Get all previous assistant messages with files
+          const previousAssistantMessages = chat.messages.filter(
+            (m) =>
+              m.role === "assistant" &&
+              extractAllCodeBlocks(m.content).length > 0,
+          );
+
+          // Extract files from both prior messages and the response. For an
+          // interrupted response, completed fences remain usable while an
+          // unfinished trailing fence is safely ignored.
+          const previousFiles = previousAssistantMessages.flatMap((msg) =>
+            extractAllCodeBlocks(msg.content),
+          );
+          const currentFiles = extractAllCodeBlocks(finalText);
+
+          // Merge files (current overrides previous for same paths)
+          const fileMap = new Map();
+          previousFiles.forEach((file) => fileMap.set(file.path, file));
+          currentFiles.forEach((file) => fileMap.set(file.path, file));
+          const allFiles = Array.from(fileMap.values());
+
+          const message = await createMessage(
+            chat.id,
+            finalText, // Store original AI response content (only changed files)
+            "assistant",
+            allFiles, // Store cumulative files
+          );
+
+          startTransition(() => {
+            resetStream();
+            setActiveMessage(message);
+            // When streaming finishes, switch to preview mode and keep the viewer open
+            setIsShowingCodeViewer(true);
+            setActiveTab("preview");
+            router.refresh();
+          });
+        });
+      };
+
+      const recoverPartialResponse = () => {
+        persistResponse(latestContent);
+      };
 
       ChatCompletionStream.fromReadableStream(stream)
         .on("content", (delta, content) => {
-          setStreamText((text) => text + delta);
+          latestContent = content;
+          setStreamText(() => sanitizeAssistantOutput(content));
 
           if (
             !didPushToCode &&
-            splitByFirstCodeFence(content).some(
-              (part) => part.type === "first-code-fence-generating",
-            )
+            parseReplySegments(content).some((seg) => seg.type === "file")
           ) {
             didPushToCode = true;
             setIsShowingCodeViewer(true);
@@ -58,50 +200,113 @@ export default function PageClient({ chat }: { chat: Chat }) {
 
           if (
             !didPushToPreview &&
-            splitByFirstCodeFence(content).some(
-              (part) => part.type === "first-code-fence",
+            parseReplySegments(content).some(
+              (seg) => seg.type === "file" && !seg.isPartial,
             )
           ) {
             didPushToPreview = true;
             setIsShowingCodeViewer(true);
-            setActiveTab("preview");
           }
         })
-        .on("finalContent", async (finalText) => {
-          startTransition(async () => {
-            const message = await createMessage(
-              chat.id,
-              finalText,
-              "assistant",
-            );
-
-            startTransition(() => {
-              isHandlingStreamRef.current = false;
-              setStreamText("");
-              setStreamPromise(undefined);
-              setActiveMessage(message);
-              router.refresh();
-            });
-          });
-        });
+        .on("finalContent", persistResponse)
+        .on("abort", recoverPartialResponse)
+        .on("error", recoverPartialResponse);
     }
 
     f();
   }, [chat.id, router, streamPromise, context]);
 
+  const submitFix = useCallback(
+    async (error: string) => {
+      if (isFixPending) return;
+
+      setIsFixPending(true);
+      // A bundler "Cannot resolve" on a response whose fences carried no
+      // {path=...} is a symptom; tell the model about the missing path tags
+      // instead so it re-sends the files correctly rather than hunting for a
+      // code bug it doesn't have.
+      const previewedMessage =
+        activeMessage ??
+        [...chat.messages].reverse().find((m) => m.role === "assistant");
+      const problem = previewedMessage
+        ? describePathlessFenceProblem(previewedMessage.content)
+        : null;
+      const newMessageText = `${FIX_REQUEST_PREFIX}\n\n${(problem ?? error).trimStart()}`;
+      const optimistic: Message = {
+        id: `optimistic-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        role: "user",
+        content: newMessageText,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        chatId: chat.id,
+        position: Number.MAX_SAFE_INTEGER,
+        files: null,
+      } as Message;
+      setOptimisticMessages((prev) => [...prev, optimistic]);
+
+      startTransition(async () => {
+        const message = await createMessage(chat.id, newMessageText, "user");
+        autoFixMessageIdsRef.current.add(message.id);
+        setOptimisticMessages((prev) =>
+          prev.filter((m) => m.id !== optimistic.id),
+        );
+
+        const nextStreamPromise = fetch(
+          "/api/get-next-completion-stream-promise",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              messageId: message.id,
+              model: chat.model,
+            }),
+          },
+        ).then((res) => {
+          if (!res.ok) {
+            throw new Error(`Generation request failed (${res.status})`);
+          }
+          if (!res.body) {
+            throw new Error("No body on response");
+          }
+          return res.body;
+        });
+
+        setStreamPromise(nextStreamPromise);
+        router.refresh();
+      });
+    },
+    [chat, isFixPending, router, activeMessage],
+  );
+
+  useEffect(() => {
+    if (!streamPromise) {
+      setIsFixPending(false);
+      setOptimisticMessages([]);
+    }
+  }, [streamPromise]);
+
+  const chatForChatLog = useMemo<Chat>(() => {
+    const existingUserContents = new Set(
+      chat.messages.filter((m) => m.role === "user").map((m) => m.content),
+    );
+    const missingOptimistic = optimisticMessages.filter(
+      (m) => !existingUserContents.has(m.content),
+    );
+    return {
+      ...chat,
+      messages: [...chat.messages, ...missingOptimistic],
+    } as Chat;
+  }, [chat, optimisticMessages]);
+
   return (
     <div className="h-dvh">
       <div className="flex h-full">
-        <div className="mx-auto flex w-full shrink-0 flex-col overflow-hidden lg:w-1/2">
-          <div className="flex items-center gap-4 px-4 py-4">
-            <Link href="/">
-              <LogoSmall />
-            </Link>
-            <p className="italic text-gray-500">{chat.title}</p>
-          </div>
+        <div
+          className={`flex w-full shrink-0 flex-col overflow-hidden ${isShowingCodeViewer ? "lg:w-[30%]" : "lg:w-full"}`}
+        >
+          <HeaderChat title={chatTitle} />
 
           <ChatLog
-            chat={chat}
+            chat={chatForChatLog}
             streamText={streamText}
             activeMessage={activeMessage}
             onMessageClick={(message) => {
@@ -140,6 +345,41 @@ export default function PageClient({ chat }: { chat: Chat }) {
               onClose={() => {
                 setActiveMessage(undefined);
                 setIsShowingCodeViewer(false);
+              }}
+              onRequestFix={submitFix}
+              isFixPending={isFixPending}
+              allowAutoFix={allowAutoFix}
+              onRestore={async (
+                message: Message | undefined,
+                oldVersion: number,
+                newVersion: number,
+              ) => {
+                startTransition(async () => {
+                  if (!message) return;
+
+                  const restoredFiles = getFilesFromMessage(message);
+                  if (restoredFiles.length === 0) return;
+
+                  const explanation = `Version ${newVersion} was created by restoring version ${oldVersion}.`;
+                  const newContent =
+                    explanation +
+                    "\n\n" +
+                    restoredFiles
+                      .map(
+                        (file) =>
+                          `\`\`\`${file.language}{path=${file.path}}\n${file.code}\n\`\`\``,
+                      )
+                      .join("\n\n");
+
+                  const newMessage = await createMessage(
+                    chat.id,
+                    newContent,
+                    "assistant",
+                    restoredFiles,
+                  );
+                  setActiveMessage(newMessage);
+                  router.refresh();
+                });
               }}
             />
           )}

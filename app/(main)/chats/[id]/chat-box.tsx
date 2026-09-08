@@ -2,12 +2,11 @@
 
 import ArrowRightIcon from "@/components/icons/arrow-right";
 import Spinner from "@/components/spinner";
-import assert from "assert";
 import { useRouter } from "next/navigation";
-import { useEffect, useRef, useTransition } from "react";
-import TextareaAutosize from "react-textarea-autosize";
-import { createMessage, getNextCompletionStreamPromise } from "../../actions";
+import { useEffect, useRef, useState, useTransition } from "react";
+import { createMessage } from "../../actions";
 import { type Chat } from "./page";
+import { MODELS } from "@/lib/constants";
 
 export default function ChatBox({
   chat,
@@ -23,6 +22,14 @@ export default function ChatBox({
   const disabled = isPending || isStreaming;
   const didFocusOnce = useRef(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [prompt, setPrompt] = useState("");
+  const textareaResizePrompt = prompt
+    .split("\n")
+    .map((text) => (text === "" ? "a" : text))
+    .join("\n");
+
+  const modelLabel =
+    MODELS.find((m) => m.value === chat.model)?.label || chat.model;
 
   useEffect(() => {
     if (!textareaRef.current) return;
@@ -36,49 +43,73 @@ export default function ChatBox({
   }, [disabled]);
 
   return (
-    <div className="mx-auto mb-5 flex w-full max-w-prose shrink-0 px-8">
+    <div className="mx-auto mb-5 flex w-full max-w-prose shrink-0 px-4">
       <form
         className="relative flex w-full"
-        action={async (formData) => {
+        action={async () => {
           startTransition(async () => {
-            const prompt = formData.get("prompt");
-            assert.ok(typeof prompt === "string");
-
             const message = await createMessage(chat.id, prompt, "user");
-            const { streamPromise } = await getNextCompletionStreamPromise(
-              message.id,
-              chat.model,
-            );
-            onNewStreamPromise(streamPromise);
+            const streamPromise = fetch(
+              "/api/get-next-completion-stream-promise",
+              {
+                method: "POST",
+                body: JSON.stringify({
+                  messageId: message.id,
+                  model: chat.model,
+                }),
+              },
+            ).then((res) => {
+              if (!res.ok) {
+                throw new Error(`Generation request failed (${res.status})`);
+              }
+              if (!res.body) {
+                throw new Error("No body on response");
+              }
+              return res.body;
+            });
 
-            router.refresh();
+            onNewStreamPromise(streamPromise);
+            startTransition(() => {
+              router.refresh();
+              setPrompt("");
+            });
           });
         }}
       >
         <fieldset className="w-full" disabled={disabled}>
-          <div className="relative flex rounded-lg border-4 border-gray-300 bg-white">
-            <TextareaAutosize
-              ref={textareaRef}
-              placeholder="Follow up"
-              autoFocus={!disabled}
-              required
-              name="prompt"
-              rows={2}
-              minRows={2}
-              className="peer relative w-full resize-none bg-transparent p-2 placeholder-gray-500 focus:outline-none disabled:opacity-50"
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  const target = event.target;
-                  if (!(target instanceof HTMLTextAreaElement)) return;
-                  target.closest("form")?.requestSubmit();
-                }
-              }}
-            />
-            <div className="pointer-events-none absolute inset-0 rounded peer-focus:outline peer-focus:outline-offset-0 peer-focus:outline-blue-500" />
+          <div className="relative flex flex-col rounded-lg border border-gray-300 bg-white">
+            <div className="relative max-h-48 w-full overflow-hidden">
+              <div className="w-full p-2.5">
+                <p className="invisible max-h-48 min-h-[48px] w-full overflow-hidden whitespace-pre-wrap">
+                  {textareaResizePrompt}
+                </p>
+              </div>
+              <textarea
+                ref={textareaRef}
+                placeholder="Ask a follow up..."
+                value={prompt}
+                onChange={(e) => setPrompt(e.target.value)}
+                required
+                name="prompt"
+                className="peer absolute bottom-1 left-0 right-1 top-1 resize-none overflow-y-auto bg-transparent px-2.5 py-1.5 placeholder-gray-500 focus:outline-none disabled:opacity-50"
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    const target = event.target;
+                    if (!(target instanceof HTMLTextAreaElement)) return;
+                    target.closest("form")?.requestSubmit();
+                  }
+                }}
+              />
+            </div>
 
-            <div className="absolute bottom-1.5 right-1.5 flex has-[:disabled]:opacity-50">
-              <div className="pointer-events-none absolute inset-0 -bottom-[1px] rounded bg-blue-700" />
+            <div className="flex w-full justify-between p-1.5 pl-2.5 has-[:disabled]:opacity-50">
+              <div
+                className="max-w-[200px] items-center truncate font-mono text-xs text-gray-500"
+                title={chat.model}
+              >
+                {modelLabel}
+              </div>
 
               <button
                 className="relative inline-flex size-6 items-center justify-center rounded bg-blue-500 font-medium text-white shadow-lg outline-blue-300 hover:bg-blue-500/75 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2"
